@@ -359,6 +359,8 @@ public:
     static_assert(NUM_UINT32_IN_INIT_WINDOW_PER_THREAD % (16 * sizeof(ValueT) / sizeof(uint32_t)) == 0);
     static_assert(2 * NUM_UINT32_IN_INIT_WINDOW_PER_THREAD <= 256);
 
+    // Before a round starts, num_incomers is below the reconstruct threshold; reserve one
+    // additional full round so compaction never needs an overflow fallback.
     static constexpr uint32_t NUM_EXTRA_SLOTS = RECONSTRUCT_THRESHOLD + NUM_ELEMS_PER_ROUND;
 
     static constexpr uint32_t NUM_RECONSTRUCT_RADIX_BITS = 8;
@@ -444,6 +446,7 @@ public:
         transac_bar_t tma_load_full_bar[NUM_TMA_LOAD_BUFS];
         transac_bar_t init_full_bar[NUM_INIT_ROUNDS_MAX];
         uint32_t warp_cnt[NUM_WARPS];
+        uint32_t candidate_slot_counter;
         uint32_t reconstruct_pivot_bucket;
         uint32_t reconstruct_num_should_select;
         CUTE_ALIGNAS(16) uint32_t reconstruct_bucket_counter[2][NUM_RECONSTRUCT_BUCKET_SLOTS];
@@ -1211,11 +1214,13 @@ public:
                     }
                 }
 
-                // Pre-issue TMA copies for the main part
-                CUTE_UNROLL
-                for (uint32_t i = 0; i < TMA_PREFETCH_DEPTH; i++) {
-                    if (i < num_main_rounds) {
-                        issue_tma_copy_for_main_rounds(i);
+                // Pre-issue TMA copies for the main part.
+                if constexpr (Config::tma_schedule_policy == TmaSchedulePolicy::Pipelined) {
+                    CUTE_UNROLL
+                    for (uint32_t i = 0; i < TMA_PREFETCH_DEPTH; i++) {
+                        if (i < num_main_rounds) {
+                            issue_tma_copy_for_main_rounds(i);
+                        }
                     }
                 }
             }
@@ -1404,14 +1409,23 @@ public:
         // row's true one and the append rate (hence the store path) stays high for the whole scan:
         // reconstruct early to tighten the pivot. Short rows would pay more for the reconstruct than the
         // extra appends cost, so they keep the plain threshold.
-        uint32_t reconstruct_trigger = num_main_rounds > 16 ? RECONSTRUCT_THRESHOLD / 4 : RECONSTRUCT_THRESHOLD;
+        uint32_t reconstruct_trigger = RECONSTRUCT_THRESHOLD;
+        if constexpr (Config::reconstruct_policy != ReconstructPolicy::Fixed) {
+            reconstruct_trigger = num_main_rounds > 16 ? RECONSTRUCT_THRESHOLD / 4 : RECONSTRUCT_THRESHOLD;
+        }
 
         uint32_t tma_buf_idx = 0;
         uint32_t tma_buf_phase = 0;
 
         for (uint32_t main_round_idx = 0; main_round_idx < num_main_rounds; ++main_round_idx) {
-            if (main_round_idx + TMA_PREFETCH_DEPTH < num_main_rounds && cute::elect_one_sync()) {
-                issue_tma_copy_for_main_rounds(main_round_idx + TMA_PREFETCH_DEPTH);
+            if constexpr (Config::tma_schedule_policy == TmaSchedulePolicy::Pipelined) {
+                if (main_round_idx + TMA_PREFETCH_DEPTH < num_main_rounds && cute::elect_one_sync()) {
+                    issue_tma_copy_for_main_rounds(main_round_idx + TMA_PREFETCH_DEPTH);
+                }
+            } else {
+                if (cute::elect_one_sync()) {
+                    issue_tma_copy_for_main_rounds(main_round_idx);
+                }
             }
 
             bool is_warp_active = is_warp_active_f(main_round_idx);
@@ -1445,59 +1459,91 @@ public:
                 }
             }
             uint32_t num_new_incomers = __popc(hit_mask);
+            uint32_t num_total_hits_in_this_round;
 
-            uint32_t warp_total_hits = __reduce_add_sync(0xFFFFFFFF, num_new_incomers);
-            if (lane_idx == 0) {
-                smem.warp_cnt[warp_idx] = warp_total_hits;
-            }
-            __syncthreads();
-            
-            static_assert(NUM_WARPS <= 32);
-            uint32_t stored_warp_hits = lane_idx < NUM_WARPS ? smem.warp_cnt[lane_idx] : 0u;
-            uint32_t num_total_hits_in_this_round = __reduce_add_sync(0xFFFFFFFF, stored_warp_hits);
-            
-            uint32_t seg_elem_base = current_permuted_segment * NUM_ELEMS_PER_SEG + offset_in_segment;
+            if constexpr (Config::candidate_compaction_policy == CandidateCompactionPolicy::SharedAtomic) {
+                uint32_t seg_elem_base = current_permuted_segment * NUM_ELEMS_PER_SEG + offset_in_segment;
+                // Element e of this thread's slice lives at smem_read_offset + (e ^ chunk_swizzle_mask)
+                uint32_t elem_addr_base = cute::cast_smem_ptr_to_uint(buf + smem_read_offset);
 
-            // Element e of this thread's slice lives at smem_read_offset + (e ^ chunk_swizzle_mask)
-            uint32_t elem_addr_base = cute::cast_smem_ptr_to_uint(buf + smem_read_offset);
-            
-            // Start the first hit's smem load before the prefix scan / count exchange below, so that its
-            // latency (and the barrier wait) overlaps with them instead of delaying the first store.
-            uint32_t first_hit_e = hit_mask != 0 ? __ffs(hit_mask) - 1u : 0u;
-            uint32_t first_hit_val = 0;
-            if (is_warp_active && warp_total_hits != 0) {
-                asm volatile ("ld.shared.u16 %0, [%1];" : "=r"(first_hit_val) : "r"(elem_addr_base + ((first_hit_e ^ chunk_swizzle_mask) << 1)));
-            }
-
-            // Lane prefix via one ballot per bit of the (<= 16) hit count: the ballots are independent,
-            // so this is much shorter on the critical path than a 5-step shuffle scan.
-            static_assert(NUM_ELEMS_PER_THREAD_PER_ROUND < 32);     // one ballot per bit of num_new_incomers
-            uint32_t lane_prefix = 0;
-            CUTE_UNROLL
-            for (uint32_t k = 0; k < 5; ++k) {
-                uint32_t bit = __ballot_sync(0xFFFFFFFF, (num_new_incomers >> k) & 1u) & ((1u << lane_idx) - 1u);
-                lane_prefix += (uint32_t)__popc(bit) << k;
-            }
-
-            uint32_t dst_slot = 
-                num_incomers +
-                __reduce_add_sync(0xFFFFFFFF, lane_idx < warp_idx ? stored_warp_hits : 0u) +
-                lane_prefix;
-
-            if (is_warp_active && warp_total_hits != 0) {
-                uint32_t dst_ptr = cute::cast_smem_ptr_to_uint(smem.incoming_topk_pairs) + dst_slot * (uint32_t)sizeof(uint64_t);
-                if (hit_mask != 0) {
-                    asm volatile ("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(dst_ptr), "r"(seg_elem_base + first_hit_e), "r"(first_hit_val) : "memory");
-                    dst_ptr += (uint32_t)sizeof(uint64_t);
+                if (threadIdx.x == 0) {
+                    smem.candidate_slot_counter = num_incomers;
                 }
-                uint32_t mask = hit_mask & (hit_mask - 1u);
-                while (mask != 0) {
-                    uint32_t e = __ffs(mask) - 1u;
-                    mask &= mask - 1u;
-                    uint32_t val_word;
-                    asm volatile ("ld.shared.u16 %0, [%1];" : "=r"(val_word) : "r"(elem_addr_base + ((e ^ chunk_swizzle_mask) << 1)));
-                    asm volatile ("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(dst_ptr), "r"(seg_elem_base + e), "r"(val_word) : "memory");
-                    dst_ptr += (uint32_t)sizeof(uint64_t);
+                __syncthreads();
+
+                uint32_t dst_slot = 0;
+                if (is_warp_active && num_new_incomers != 0) {
+                    dst_slot = atomicAdd_block(&smem.candidate_slot_counter, num_new_incomers);
+                }
+                __syncthreads();
+                num_total_hits_in_this_round = smem.candidate_slot_counter - num_incomers;
+
+                if (is_warp_active && num_new_incomers != 0) {
+                    uint32_t dst_ptr = cute::cast_smem_ptr_to_uint(smem.incoming_topk_pairs) + dst_slot * (uint32_t)sizeof(uint64_t);
+                    uint32_t mask = hit_mask;
+                    while (mask != 0) {
+                        uint32_t e = __ffs(mask) - 1u;
+                        mask &= mask - 1u;
+                        uint32_t val_word;
+                        asm volatile ("ld.shared.u16 %0, [%1];" : "=r"(val_word) : "r"(elem_addr_base + ((e ^ chunk_swizzle_mask) << 1)));
+                        asm volatile ("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(dst_ptr), "r"(seg_elem_base + e), "r"(val_word) : "memory");
+                        dst_ptr += (uint32_t)sizeof(uint64_t);
+                    }
+                }
+            } else {
+                uint32_t warp_total_hits = __reduce_add_sync(0xFFFFFFFF, num_new_incomers);
+                if (lane_idx == 0) {
+                    smem.warp_cnt[warp_idx] = warp_total_hits;
+                }
+                __syncthreads();
+
+                static_assert(NUM_WARPS <= 32);
+                uint32_t stored_warp_hits = lane_idx < NUM_WARPS ? smem.warp_cnt[lane_idx] : 0u;
+                num_total_hits_in_this_round = __reduce_add_sync(0xFFFFFFFF, stored_warp_hits);
+
+                uint32_t seg_elem_base = current_permuted_segment * NUM_ELEMS_PER_SEG + offset_in_segment;
+
+                // Element e of this thread's slice lives at smem_read_offset + (e ^ chunk_swizzle_mask)
+                uint32_t elem_addr_base = cute::cast_smem_ptr_to_uint(buf + smem_read_offset);
+
+                // Start the first hit's smem load before the prefix scan / count exchange below, so that its
+                // latency (and the barrier wait) overlaps with them instead of delaying the first store.
+                uint32_t first_hit_e = hit_mask != 0 ? __ffs(hit_mask) - 1u : 0u;
+                uint32_t first_hit_val = 0;
+                if (is_warp_active && warp_total_hits != 0) {
+                    asm volatile ("ld.shared.u16 %0, [%1];" : "=r"(first_hit_val) : "r"(elem_addr_base + ((first_hit_e ^ chunk_swizzle_mask) << 1)));
+                }
+
+                // Lane prefix via one ballot per bit of the (<= 16) hit count: the ballots are independent,
+                // so this is much shorter on the critical path than a 5-step shuffle scan.
+                static_assert(NUM_ELEMS_PER_THREAD_PER_ROUND < 32);     // one ballot per bit of num_new_incomers
+                uint32_t lane_prefix = 0;
+                CUTE_UNROLL
+                for (uint32_t k = 0; k < 5; ++k) {
+                    uint32_t bit = __ballot_sync(0xFFFFFFFF, (num_new_incomers >> k) & 1u) & ((1u << lane_idx) - 1u);
+                    lane_prefix += (uint32_t)__popc(bit) << k;
+                }
+
+                uint32_t dst_slot =
+                    num_incomers +
+                    __reduce_add_sync(0xFFFFFFFF, lane_idx < warp_idx ? stored_warp_hits : 0u) +
+                    lane_prefix;
+
+                if (is_warp_active && warp_total_hits != 0) {
+                    uint32_t dst_ptr = cute::cast_smem_ptr_to_uint(smem.incoming_topk_pairs) + dst_slot * (uint32_t)sizeof(uint64_t);
+                    if (hit_mask != 0) {
+                        asm volatile ("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(dst_ptr), "r"(seg_elem_base + first_hit_e), "r"(first_hit_val) : "memory");
+                        dst_ptr += (uint32_t)sizeof(uint64_t);
+                    }
+                    uint32_t mask = hit_mask & (hit_mask - 1u);
+                    while (mask != 0) {
+                        uint32_t e = __ffs(mask) - 1u;
+                        mask &= mask - 1u;
+                        uint32_t val_word;
+                        asm volatile ("ld.shared.u16 %0, [%1];" : "=r"(val_word) : "r"(elem_addr_base + ((e ^ chunk_swizzle_mask) << 1)));
+                        asm volatile ("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(dst_ptr), "r"(seg_elem_base + e), "r"(val_word) : "memory");
+                        dst_ptr += (uint32_t)sizeof(uint64_t);
+                    }
                 }
             }
             Base::advance_perm_state(current_permuted_segment, permuted_segment_stride_per_round, perm_len);

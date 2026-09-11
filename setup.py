@@ -20,9 +20,31 @@ if len(instantiation_sources) != 40:
         f"found {len(instantiation_sources)}"
     )
 
+ablation_instantiations_dir = (
+    ROOT / "csrc" / "cuda_kernels" / "v3" / "ablation_instantiations"
+)
+ablation_instantiation_sources = sorted(ablation_instantiations_dir.glob("*.cu"))
+if len(ablation_instantiation_sources) != 3:
+    raise RuntimeError(
+        f"Expected 3 CUDA ablation instantiations in {ablation_instantiations_dir}, "
+        f"found {len(ablation_instantiation_sources)}"
+    )
+
+cluster_instantiations_dir = (
+    ROOT / "csrc" / "cuda_kernels" / "v3_cluster" / "instantiations"
+)
+cluster_instantiation_sources = sorted(cluster_instantiations_dir.glob("*.cu"))
+if len(cluster_instantiation_sources) != 3:
+    raise RuntimeError(
+        f"Expected 3 CUDA cluster instantiations in {cluster_instantiations_dir}, "
+        f"found {len(cluster_instantiation_sources)}"
+    )
+
 sources = [
     "csrc/api.cpp",
     *(str(path.relative_to(ROOT)) for path in instantiation_sources),
+    *(str(path.relative_to(ROOT)) for path in ablation_instantiation_sources),
+    *(str(path.relative_to(ROOT)) for path in cluster_instantiation_sources),
 ]
 
 cuda_archs = [

@@ -1,26 +1,43 @@
-# H20 Top-K 逐步优化说明
+# H20 Top-K 累积优化与 Cluster 实测
 
-## 1. 测试设置
+## 1. 公平测试契约
 
 - GPU：NVIDIA H20，CUDA 架构 `sm_90a`
-- 数据类型：BF16
-- Batch：256
+- 输入与输出值：BF16
+- 输出索引：INT64
+- Batch：6
 - K：512
-- 输入尺寸 N：1024、4096、16384、65536、131072、262144
-- 计时：CUDA Event，20 次预热，50 次测量，报告中位延迟
-- 正确性：使用 `randn` 输入，逐行完整比较 Top-K 值集合，并验证返回值与索引一致
+- 输出：完整且正确的无序 Top-K values 和 indices
+- N：64K、128K、256K、512K、1M、2M、4M
+- 计时：20 次预热，50 次逐样本 CUDA Event 测量，报告 median/p90
+- 指标：`batch * N * sizeof(BF16) / median latency`
+- 禁止：CPU wall time、插桩、Perfetto、Nsys 和 Ncu
 
-性能图：
+每个实现都验证输出 shape/dtype、索引范围、每行索引唯一、`values == input.gather(indices)`，并将完整 Top-K 值多重集合与 PyTorch reference 比较。压力测试覆盖多 seed、normal、uniform、全相等、大量重复值、升序、降序、batch 1/2/3/6、512/4096/8192 边界和最高 4M 宽度。
 
-[assets/topk_h20_stages.png](assets/topk_h20_stages.png)
+性能图：[assets/topk_h20_stages.png](assets/topk_h20_stages.png)
 
-原始数据：
+原始数据：[assets/topk_h20_stages.json](assets/topk_h20_stages.json)。JSON 包含 77 个点的全部 CUDA Event 样本、median、p90、capability、canary 状态和 cluster 选择过程。
 
-[assets/topk_h20_stages.json](assets/topk_h20_stages.json)
+## 2. 累积阶段
 
-## 2. V0：完整排序
+| 阶段 | 相比前一阶段只增加的主要机制 |
+|---|---|
+| V0 Full sort | `torch.sort` 全排序后取前 K |
+| V1 Partial select | 改为 `torch.topk(sorted=True)`，避免全量排序 |
+| V2 Unsorted Top-K | 改为 `sorted=False`，不再排序 K 个输出 |
+| V3A Scan/filter + atomic | 专用 BF16 Scan-Filter-Compact；shared atomic 分配候选槽；串行 TMA；固定重构阈值 |
+| V3B Ballot compaction | 只把 shared atomic 分配替换为 ballot/popcount/prefix |
+| V3C TMA pipeline | 只把当前轮搬运改为多缓冲 TMA 预取流水 |
+| V3D Adaptive threshold | 只对长行提前重构，使阈值更快升高 |
+| V3E Adaptive dispatch | 加入生产版按 wave 选择 256/512 threads、4096/8192 元素每轮和 TMA 深度 |
+| V3F Cluster Cx | C 个 CTA 分担一行，DSM 汇总 local Top-K，CTA0 再做 global Top-K |
 
-实现：
+V3A 必须同时包含精确初始阈值、scan/filter 和 radix-select：如果没有这个基础不变量，最坏情况下需要保存 O(N) 个候选，无法在固定 shared memory 中公平实现宽行版本。
+
+## 3. V0、V1、V2 删除了什么工作
+
+### V0：完整排序
 
 ```python
 values, indices = torch.sort(x, dim=1, descending=True)
@@ -28,268 +45,224 @@ values = values[:, :k]
 indices = indices[:, :k]
 ```
 
-V0 先对每一行的全部 N 个元素降序排序，再截取前 K 个结果。
+V0 计算全部 N 个元素的完整顺序，然后只保留 K 个，近似工作量为 `O(N log N)`。
 
-### 特点
-
-- 计算了 Top-K 不需要的后 `N-K` 个元素之间的完整顺序。
-- 近似计算复杂度为 `O(N log N)`。
-- 中间结果包含全部 N 个排序值和索引，读写流量较大。
-- 优点是实现简单，并且输出天然有序，适合作为基础版本。
-
-### 性能
-
-当 `N=262144` 时，中位延迟为 `4372.21 us`，定义为 `1.00x` 基线。
-
-## 3. V1：部分选择
-
-实现：
+### V1：部分选择
 
 ```python
 values, indices = torch.topk(x, k, dim=1, sorted=True)
 ```
 
-V1 不再排序全部 N 个元素，只寻找最大的 K 个元素，然后对这 K 个输出排序。
+V1 只寻找最大的 K 个元素，再排序这 K 个输出，删除了后 `N-K` 个元素之间无意义的排序。
 
-### 相比 V0 的变化
-
-- 删除了后 `N-K` 个元素之间无意义的排序工作。
-- 主要工作从“全量排序”变成“Top-K 选择 + K 个结果排序”。
-- 当 `K << N` 时，选择算法明显优于全量排序。
-
-### 性能特点
-
-- `N=262144`：`915.36 us`，相对 V0 为 `4.78x`。
-- 在 `N=1024` 和 `N=4096` 等小输入上，调度和选择逻辑的固定开销可能超过节省的排序工作，因此不一定比 V0 快。
-- 输入越大，避免全量排序带来的收益越明显。
-
-## 4. V2：跳过 Top-K 输出排序
-
-实现：
+### V2：无序 Top-K
 
 ```python
 values, indices = torch.topk(x, k, dim=1, sorted=False)
 ```
 
-V2 仍然返回完全正确的 Top-K 值和索引，但不保证这 K 个结果内部有序。
+V2 仍返回完全正确的 Top-K 集合，但不保证内部顺序，因此可以省去最终输出排序。V2 与全部 V3 阶段具有相同输出契约。
 
-### 相比 V1 的变化
+## 4. V3 的共同算法：Scan-Filter-Compact
 
-- V1 的输出契约要求 `values[:, 0] >= values[:, 1] >= ...`。
-- V2 只要求返回的集合是 Top-K，不要求集合内部顺序。
-- 因此可以省去或简化最终 K 个候选的排序工作。
+### 4.1 CTA、warp 与线程分工
 
-### 性能特点
+normal V3 让一个 CTA 处理一行，每行独立维护 survivor、候选和阈值，不需要跨 CTA 同步。
 
-- `N=262144`：`897.44 us`，相对 V0 为 `4.87x`。
-- 相比 V1 仅提升约 `1.02x`。
-- 原因是 K 只有 512；大输入下，扫描 N 个输入元素和执行 Top-K 选择才是主要开销，最终排序 512 个结果占比很小。
+每个线程一轮检查 16 个 BF16；一个 32-thread warp 覆盖 512 个元素：
 
-V2 与 V3 都返回值、INT64 索引和无序 Top-K，因此二者具有一致的输出契约，是最直接的公平对比。
+- 256 threads：8 个 warp，每轮 4096 个元素。
+- 512 threads：16 个 warp，每轮 8192 个元素。
 
-## 5. V3：DeepSelect
+输入通过 TMA 搬入 shared memory，线程并行比较、压缩候选，并在需要时执行 radix-select。
 
-实现：
+### 4.2 阈值不是猜测值
 
-```python
-values, indices = deep_select.topk(
-    x,
-    k,
-    sorted=False,
-    indices_type=torch.int64,
-    return_value=True,
-    abort_when_nan_found=False,
-)
-```
-
-DeepSelect 的核心思想是 Scan-Filter-Compact，即“扫描、过滤、压缩”。它避免让全部 N 个元素进入昂贵的选择或排序过程。
-
-### 5.1 CTA、warp 与线程如何分工
-
-normal-v3 路径让一个 CTA 独立处理一行，因此每一行都有自己的候选集合和阈值，不需要跨 CTA 同步。
-
-每个线程一轮读取并检查 16 个 BF16；一个 warp 的 32 个线程因此覆盖 512 个元素。内核根据 batch、K 和 GPU wave 数选择 256 或 512 个线程：
-
-- 256 threads：8 个 warp，每轮扫描 4096 个元素。
-- 512 threads：16 个 warp，每轮扫描 8192 个元素。
-
-后续轮次使用 TMA 和 shared-memory 环形缓冲区流水搬运数据，使下一轮读取尽量与当前轮比较、压缩重叠。
-
-### 5.2 动态阈值不是猜测值
-
-内核先从初始窗口中精确选出 K 个 survivor。阈值是这些 survivor 中最小的值，也就是当前已扫描数据的第 K 大值：
+内核先从初始窗口精确选出 K 个 survivor：
 
 ```text
 survivors = TopK(已经扫描的数据)
 threshold = min(survivors)
 ```
 
-这个定义给出了关键不变量：内核始终保存已经扫描区域的完整 Top-K。即使后面的元素全部没有超过阈值，已有 survivor 也仍然提供完整的 K 个结果。
-
-对于尚未扫描完整行时，当前第 K 大值相对最终第 K 大值只可能偏低，不可能偏高。随着数据集合扩大，第 K 大值只会保持或升高。因此旧阈值最多让额外候选通过，不会错误丢弃真正的最终 Top-K：
+关键不变量是：survivor 始终是已扫描区域的完整 Top-K。数据集合扩大时，第 K 大值只会保持或升高，所以旧阈值只可能偏低，不可能过高：
 
 ```text
-value > threshold  -> 可能替换当前 survivor，保留为候选
-value < threshold  -> 前面已经至少有 K 个更大元素，可以安全丢弃
-value = threshold  -> 已有 survivor 足以占满 K；相同值之间允许任选
+value > threshold  -> 可能进入最终 Top-K，保留
+value < threshold  -> 已有至少 K 个更大值，安全丢弃
+value = threshold  -> 相同值任选，但最终必须精确补足 K 个
 ```
 
-当 pivot 存在重复值时，radix-select 会先统计 `> pivot` 的数量，再设置 `eq_quota = K - count_gt`，只从 `== pivot` 的元素中补足所需数量，保证 survivor 始终恰好有 K 个。
+因此不会出现“阈值过高导致最后不足 K 个，再向下寻找”。旧阈值偏低只会放进额外候选，影响性能而不影响正确性。
 
-### 5.3 每个线程先产生局部命中掩码
+### 4.3 候选为什么需要写入位置
 
-线程把自己负责的 16 个值与阈值比较，生成一个 16-bit `hit_mask`：
+每个线程对自己的 16 个值生成 16-bit `hit_mask`，`popc(hit_mask)` 是该线程命中的候选数量。所有线程随后并行写同一个 shared-memory candidate array，所以必须得到互不重叠的临时槽位；这个位置不是原始输入 index，而是紧凑候选数组中的写入位置。
+
+V3A 使用 CTA shared counter。每个活跃线程用一次 `atomicAdd_block` 领取一段连续槽位，再把自己的命中元素写进去。它不是每个候选执行一次 global atomic。
+
+V3B 改用两级前缀和：
+
+1. 每个 warp 汇总自己的命中总数。
+2. shared memory 中的 warp totals 给出前面 warp 占用的槽位数。
+3. warp 内将每线程 0–16 的命中数拆成 5 个 bit。
+4. 对每个 bit 执行一次 `ballot`。
+5. 当前 lane 对自己之前的置位执行 `popc`，加权还原 exclusive prefix。
+
+最终：
 
 ```text
-values:    1.2  3.1  0.5  2.8 ...
-threshold: 2.0
-hit_mask:   0    1    0    1  ...
+dst_slot = 旧候选数量
+         + 前面 warp 的命中总数
+         + 当前 warp 内前面线程的命中总数
 ```
 
-`popc(hit_mask)` 给出该线程需要写入的候选数量。接下来必须为所有命中元素分配连续且互不冲突的 shared-memory 位置。
+每个线程再用 `ffs` 依次取出 `hit_mask` 中的命中项，连续写入自己的槽位区间。
 
-### 5.4 Ballot 与两级前缀和如何压缩候选
+### 4.4 Radix-select 如何保持恰好 K 个
 
-首先，每个 warp 使用 `__reduce_add_sync` 汇总 32 个线程的命中数量。lane 0 将 warp 总数写入 `smem.warp_cnt[warp_id]`，CTA 同步后，每个 warp 就能计算前面所有 warp 占用了多少位置。
-
-warp 内还需要计算每个线程之前有多少命中。普通实现可以用 `shfl_up` 按 1、2、4、8、16 五个距离执行前缀扫描；DeepSelect 利用“每线程最多命中 16 个”这一约束，将命中数量拆成 5 个二进制位，并对每一位执行一次 ballot：
+候选达到触发规模后，CTA 对“旧 survivor + 新 candidates”重新选择：
 
 ```text
-B[k] = ballot((thread_hit_count >> k) & 1)
-lane_prefix += popc(B[k] 中位于当前 lane 之前的位) * 2^k
+new_survivors = TopK(old_survivors + candidates)
+new_threshold = min(new_survivors)
 ```
 
-五个 ballot 彼此没有逐级依赖。组合五个位的结果后，`lane_prefix` 就等于当前 warp 中前面所有线程的命中总数。
+这里不是完整排序，而是两级 8-bit radix-select：
 
-每个线程的最终写入起点为：
+1. 把 BF16 bit pattern 映射为可按无符号整数比较的顺序。
+2. 统计高 8 bit 的 256 个桶，定位第 K 大所在桶。
+3. 只对该桶统计低 8 bit，得到精确 pivot。
+4. 保留全部 `> pivot` 的元素。
+5. 计算 `eq_quota = K - count_gt`，从 `== pivot` 中补足恰好 K 个。
+
+survivor 使用双缓冲区，重构后交换读写角色。
+
+## 5. V3A→V3E 的受控差异
+
+### V3A：atomic + serial TMA + fixed threshold
+
+V3A 是专用算法基础版。它已有精确初始 Top-K、阈值过滤和 radix-select，但 TMA 每轮发起后立即等待，没有 lookahead；候选使用 shared atomic 分配；累计约 4096 个候选后才重构。
+
+### V3B：ballot compaction
+
+V3B 只替换候选槽位分配。实测几何平均为 V3A 的 `0.94x`，在 4M 也为 `0.94x`。这说明当前 H20、K=512、batch=6 矩阵下，ballot/prefix 的额外指令并未被避免 shared atomic 的收益抵消。该结论来自受控 CUDA Event 对比，不依赖硬件计数器。
+
+### V3C：多缓冲 TMA pipeline
+
+V3C 保留 ballot 和固定重构阈值，只加入 D4 环形 TMA 缓冲：当前轮比较与候选压缩时提前搬运后续轮次。它相对 V3B 的完整矩阵几何平均为 `1.51x`，4M 为 `2.26x`，是 normal 消融中最大的单步收益。
+
+### V3D：adaptive threshold
+
+V3D 只改变重构触发时机：长行约累计 1024 个候选就提前 radix-select，而不是始终等待约 4096 个。更早得到较高阈值后，后续轮次通常写入更少候选。实测几何平均为 V3C 的 `1.01x`，4M 为 `1.01x`。
+
+### V3E：生产版 adaptive dispatch
+
+V3E 根据 batch 与 SM 数得到 wave 数，并选择：
+
+- 单 wave：512 threads、每轮 8192 元素、较深 TMA pipeline。
+- 多 wave：256 threads、每轮 4096 元素、面向更高 CTA occupancy 的配置。
+
+本次 batch=6 属于低 wave 场景。V3E 相对 V3D 的几何平均为 `1.22x`，4M 为 `1.36x`。
+
+## 6. V3F：H20 thread-block cluster
+
+### 6.1 多 CTA 如何处理同一行
+
+cluster Cx 为每行启动 C 个 CTA：
+
+1. rank 0 负责行尾的非置换区域。
+2. 可置换前缀按访问顺序切成 C 个连续范围。
+3. 每个 CTA 独立执行与 normal V3 相同的扫描，得到 local Top-K。
+4. 每个 CTA 通过 Distributed Shared Memory 异步写入 rank 0 的 shared memory。
+5. rank 0 收齐最多 `C * K` 个 local candidates，再做一次 global radix-select。
+6. 只有 rank 0 写最终 global output。
+
+local Top-K 的并集一定包含 global Top-K：如果一个元素连自己分片的前 K 都进不了，它前面至少已有 K 个更大元素，因此不可能进入整行 Top-K。
+
+### 6.2 DSM 生命周期
+
+实现同时把 DSM 数据地址和 completion mbarrier 地址映射到 rank 0。barrier 初始化后执行 cluster-scoped rendezvous；rank 0 先注册 expected transaction bytes，所有 rank 再发起 remote async store。rank 0 等 value gather 后可开始 pivot 计算，再等待 pair gather。最终输出完成后所有 CTA 再 rendezvous，避免非零 rank 在 remote store 或 rank 0 消费 DSM scratch 前退出。
+
+shortcut、正常路径和 NaN 路径遵守同一 CTA 生命周期协议。
+
+### 6.3 H20 capability 与 canary
+
+| Cluster | Dynamic shared memory | Registers/thread | Max potential cluster | Max active clusters | 结果 |
+|---:|---:|---:|---:|---:|---|
+| C2 | 93,184 B | 96 | 8 | 78 | 通过 |
+| C4 | 109,568 B | 96 | 8 | 32 | 通过 |
+| C8 | 142,336 B | 96 | 8 | 7 | 通过 |
+
+三个内核均为零 spill。每个 size 都在独立 Python 进程中通过 exact occupancy query、首次 launch、边界/重复值正确性和 50 次重复 DSM launch。H20 对精确内核报告的最大 potential cluster size 是 8，因此本项目不构建 C16。
+
+## 7. 实测结果
+
+### 7.1 完整矩阵几何平均
+
+| 阶段 | 几何平均有效带宽 | 相比前一 normal 阶段 |
+|---|---:|---:|
+| V0 | 20.7 GB/s | — |
+| V1 | 49.7 GB/s | 2.40x |
+| V2 | 56.6 GB/s | 1.14x |
+| V3A | 58.6 GB/s | 1.04x |
+| V3B | 54.9 GB/s | 0.94x |
+| V3C | 82.9 GB/s | 1.51x |
+| V3D | 84.0 GB/s | 1.01x |
+| V3E | 102.7 GB/s | 1.22x |
+
+Cluster 候选都直接与 V3E 比较：
+
+| Cluster | 几何平均有效带宽 | 相对 V3E |
+|---:|---:|---:|
+| C2 | 114.6 GB/s | 1.12x |
+| C4 | 157.5 GB/s | 1.53x |
+| C8 | 194.8 GB/s | 1.90x |
+
+按“完整宽度矩阵几何平均最高”选择固定 C8；图中仍以透明虚线保留 C2/C4，不逐点选择不同 cluster size。
+
+### 7.2 4M 宽度的逐阶段结果
+
+| 阶段 | Median | 有效带宽 | 相比前一阶段 |
+|---|---:|---:|---:|
+| V0 | 1410.69 us | 35.7 GB/s | — |
+| V1 | 470.03 us | 107.1 GB/s | 3.00x |
+| V2 | 452.90 us | 111.1 GB/s | 1.04x |
+| V3A | 797.97 us | 63.1 GB/s | 0.57x |
+| V3B | 846.29 us | 59.5 GB/s | 0.94x |
+| V3C | 373.66 us | 134.7 GB/s | 2.26x |
+| V3D | 371.46 us | 135.5 GB/s | 1.01x |
+| V3E | 272.42 us | 184.8 GB/s | 1.36x |
+| V3F C2 | 234.88 us | 214.3 GB/s | 1.16x vs V3E |
+| V3F C4 | 115.76 us | 434.8 GB/s | 2.35x vs V3E |
+| V3F C8 | 70.18 us | 717.2 GB/s | 3.88x vs V3E |
+
+Cluster 在小宽度主要受固定启动、同步和最终 merge 开销影响：64K 时 C8 相对 V3E 约 `1.05x`。随着 N 增大，单行可并行扫描工作增加，C8 的收益扩大到 4M 的 `3.88x`。
+
+## 8. HBM 屋顶线
+
+图中的有效输入带宽定义为：
 
 ```text
-dst_slot = 之前轮次的候选数
-         + 前面 warp 的命中数
-         + 当前 warp 内前面线程的命中数
+effective GB/s = batch * N * sizeof(BF16) / median CUDA Event latency
 ```
 
-线程再通过 `ffs` 依次取出 `hit_mask` 中的置位，将自己的候选连续写入 `dst_slot` 开始的位置。这样所有候选自然形成无空洞数组，不需要为每个元素执行全局 atomic，也不会发生写入冲突。
+H20 HBM 理论峰值按 `4000 GB/s` 绘制。它假设输入只读一次，是统一的乐观屋顶线，不是硬件计数器测得的实际 HBM 流量。
 
-### 5.5 候选重构与阈值更新
+在 `batch=6, N=4M`：
 
-阈值在任何时刻都是正确的；什么时候更新阈值只影响性能。候选积累到触发规模后，CTA 对下面的集合重新选择：
+- V3E：184.8 GB/s，峰值的 4.62%。
+- V3F C8：717.2 GB/s，峰值的 17.93%。
+- C8 相对 V3E：3.88x。
 
-```text
-新的 survivors = TopK(旧 survivors + 新 candidates)
-新的 threshold = min(新的 survivors)
-```
+剩余差距包含低 batch 下可用并行度、候选处理、TMA/DSM 同步、radix-select 和输出写回等成本；由于本实验没有使用硬件计数器，不进一步虚构具体 stall 或流量归因。
 
-普通情况约积累 4096 个候选后重构；长行会提前到约 1024 个候选，避免使用偏低的旧阈值收集过多元素。
+## 9. 关键代码
 
-重构不是完整排序，而是两级 8-bit radix-select：
-
-1. 将 BF16 bit pattern 转换为可按无符号整数比较的顺序。
-2. 并行统计高 8 bit 的 256 个直方桶，定位第 K 大值所在桶。
-3. 只对目标高位桶统计低 8 bit，得到精确 pivot。
-4. 保留全部 `> pivot` 的元素，再按 `eq_quota` 补足 `== pivot` 的元素。
-5. 将恰好 K 个 survivor 写入另一个 shared-memory buffer，并交换双缓冲区。
-
-因此重构触发得晚，只会增加候选写入和下一次 radix-select 的工作量，不影响正确性；它不会出现“阈值过高导致最后不足 K 个，再向下寻找”的回退流程。
-
-### 5.6 扫描结束
-
-扫描完成后，如果仍有未重构候选，内核再执行一次相同的 radix-select。最终 survivor buffer 已经包含整行精确的无序 Top-K，随后写回 BF16 values 和 INT64 indices。
-
-### 5.7 为什么提升最大
-
-V0→V1 和 V1→V2 主要减少排序工作；V2→V3 则改变了进入重型选择过程的数据量：
-
-```text
-V2：扫描全部 N，并由通用 Top-K 路径处理选择
-V3：并行扫描全部 N，但只让少量阈值候选进入压缩和重新选择
-```
-
-当 `N=262144` 时：
-
-- V2：`897.44 us`
-- V3：`90.94 us`
-- V2→V3：`9.87x`
-- V0→V3：`48.08x`
-
-因此最大收益来自候选集缩减、warp 级无原子压缩以及 BF16/H20 专用实现，而不是单条 CUDA 指令或跳过一次小排序。
-
-## 6. 理论硬件上限与当前差距
-
-图中的绝对性能定义为：
-
-```text
-有效输入带宽 = batch * N * sizeof(BF16) / 中位延迟
-```
-
-该指标统计每个输入元素被读取一次所对应的数据率。它是统一比较不同算法的绝对吞吐指标，不是硬件计数器测得的实际 HBM 流量。
-
-本机 H20 的 HBM3 标称峰值带宽约为 `4.0 TB/s = 4000 GB/s`。因此图中加入了 `4000 GB/s` 水平虚线作为理想硬件屋顶线。
-
-对于 `batch=256, N=262144, BF16`：
-
-```text
-输入字节数       = 256 * 262144 * 2 = 134217728 Bytes
-理论最低读取时间 = 134217728 / 4.0 TB/s = 33.55 us
-DeepSelect 实测   = 90.94 us
-有效输入带宽     = 1475.8 GB/s
-峰值利用率       = 1475.8 / 4000 = 36.90%
-距离理论上限     = 4000 / 1475.8 = 2.71x
-```
-
-DeepSelect 在不同尺寸下距离 HBM 屋顶线的情况如下：
-
-| N | DeepSelect 有效输入带宽 | HBM 峰值利用率 | 距离理论上限 |
-|---:|---:|---:|---:|
-| 1024 | 21.0 GB/s | 0.53% | 190.06x |
-| 4096 | 81.7 GB/s | 2.04% | 48.98x |
-| 16384 | 197.8 GB/s | 4.95% | 20.22x |
-| 65536 | 889.0 GB/s | 22.23% | 4.50x |
-| 131072 | 1165.7 GB/s | 29.14% | 3.43x |
-| 262144 | 1475.8 GB/s | 36.90% | 2.71x |
-
-小尺寸距离屋顶线很远，主要因为 kernel launch、同步和固定选择开销无法被足够多的数据摊薄。尺寸增大后，DeepSelect 越来越接近带宽受限状态。
-
-`4.0 TB/s` 是只读取输入一次的乐观上限。真实 Top-K 还需要阈值维护、候选写入与压缩、同步以及结果写回，因此不能把剩余差距全部视为可消除的软件损失。
-
-## 7. 六个输入尺寸的实测结果
-
-| N | V0 完整排序 | V1 部分选择 | V2 无序 Top-K | V3 DeepSelect | V3 有效输入带宽 |
-|---:|---:|---:|---:|---:|---:|
-| 1024 | 41.12 us | 45.38 us | 32.56 us | 24.91 us | 21.0 GB/s |
-| 4096 | 49.89 us | 68.83 us | 63.74 us | 25.68 us | 81.7 GB/s |
-| 16384 | 303.55 us | 115.79 us | 102.34 us | 42.40 us | 197.8 GB/s |
-| 65536 | 1125.70 us | 268.72 us | 254.11 us | 37.74 us | 889.0 GB/s |
-| 131072 | 2214.45 us | 527.60 us | 509.86 us | 57.57 us | 1165.7 GB/s |
-| 262144 | 4372.21 us | 915.36 us | 897.44 us | 90.94 us | 1475.8 GB/s |
-
-DeepSelect 在六个输入尺寸上均为最快版本，并且 N 越大，相对优势和绝对带宽都越高。
-
-## 8. H20 适配说明
-
-本项目在 H20 上使用 `sm_90a` 构建：
-
-- `setup.py` 支持通过 `DEEP_SELECT_CUDA_ARCHS=90a` 选择目标架构。
-- SM90 使用 128-bit 全局加载和存储路径。
-- 教学仓库仅保留 H20 使用的 normal v3 内核，不包含 SM100 cluster 路径。
-- 所有性能数字均来自 H20 原生 CUDA 扩展实测，不是模拟结果。
-
-关键代码：
-
-- 版本定义与正确性：[tests/learn_topk.py](tests/learn_topk.py)
-- 折线图生成：[tests/plot_topk_stages.py](tests/plot_topk_stages.py)
-- DeepSelect CUDA 内核：[csrc/cuda_kernels/](csrc/cuda_kernels/)
-- H20 分派逻辑：[csrc/api.cpp](csrc/api.cpp)
-
-## 9. 结论
-
-优化路线可以概括为：
-
-```text
-完整排序
-  -> 只选择 Top-K
-  -> 不排序 Top-K 输出
-  -> 扫描时过滤并压缩候选集合
-```
-
-前三个版本逐步删除不必要的排序工作；DeepSelect 进一步减少进入选择过程的数据量，因此取得数量级最大的性能提升。
+- 编译期消融策略：[csrc/cuda_kernels/config.h](csrc/cuda_kernels/config.h)
+- 共享 scan/filter/radix 实现：[csrc/cuda_kernels/common_parts.cuh](csrc/cuda_kernels/common_parts.cuh)
+- normal V3：[csrc/cuda_kernels/v3/topk_select.cuh](csrc/cuda_kernels/v3/topk_select.cuh)
+- H20 cluster V3：[csrc/cuda_kernels/v3_cluster/topk_select.cuh](csrc/cuda_kernels/v3_cluster/topk_select.cuh)
+- 教学 variant 分派：[csrc/api.cpp](csrc/api.cpp)
+- 正确性、preflight 与 CUDA Event benchmark：[tests/learn_topk.py](tests/learn_topk.py)
+- 单坐标图：[tests/plot_topk_stages.py](tests/plot_topk_stages.py)
